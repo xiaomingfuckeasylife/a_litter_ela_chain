@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -26,14 +27,18 @@ type Config struct {
 
 type Address_history struct{
 	History []Block_transaction_history
+	TotalNum int
 }
 
 type Block_transaction_history struct {
 	Txid string
-	Type string `json:type`
+	Type string
 	Value string
 	CreateTime string
 	Height int
+	Fee string
+	Inputs  []string
+	Outputs []string
 }
 
 const (
@@ -45,6 +50,7 @@ const (
  	SPEND = "spend"
  	ERROR_REQUEST = "Error Request :"
  	ELA = 100000000
+ 	MINEING_ADDR = "0000000000000000000000000000000000"
 )
 
 func main(){
@@ -107,7 +113,7 @@ func sync(tx *sql.Tx) error{
 				continue
 			}
 			for _ , v := range txArr {
-				stmt , err := tx.Prepare("insert into block_transaction_history (address,txid,type,value,createTime,height) values(?,?,?,?,?,?)")
+				stmt , err := tx.Prepare("insert into block_transaction_history (address,txid,type,value,createTime,height,fee,inputs,outputs) values(?,?,?,?,?,?,?,?,?)")
 				if err != nil {
 					return err
 				}
@@ -119,18 +125,34 @@ func sync(tx *sql.Tx) error{
 				_type := INCOME
 				if t == 0 {
 					vout :=  vm["vout"].([]interface{})
+					coinbase := make([]map[string]interface{},0)
+					to := ""
 					for _ , vv := range vout{
 						vvm := vv.(map[string]interface{})
 						value := vvm["value"].(string)
 						address := vvm["address"].(string)
-						_ , err := stmt.Exec(address,txid,_type,value,strconv.FormatFloat(time,'f',0,64),curr)
+						coinbaseMap := make(map[string]interface{})
+						coinbaseMap["value"] = value
+						coinbaseMap["address"] = address
+						coinbase = append(coinbase,coinbaseMap)
+						to += address +","
+
+					}
+
+					for _ , v := range coinbase {
+						_ , err := stmt.Exec(v["address"],txid,_type,v["value"],strconv.FormatFloat(time,'f',0,64),curr,0,MINEING_ADDR,to)
 						if err != nil {
 							return err
 						}
 					}
+
 				}else{
+
 					vin :=  vm["vin"].([]interface{})
 					spend := make(map[string]float64)
+					totalInput := 0.0
+					from := ""
+					to := ""
 					for _ , vv := range vin{
 						vvm := vv.(map[string]interface{})
 						vintxid := vvm["txid"].(string)
@@ -143,6 +165,7 @@ func sync(tx *sql.Tx) error{
 						voutm := vout.(map[string]interface{})
 						address := voutm["address"].(string)
 						value, err:= strconv.ParseFloat(voutm["value"].(string),64)
+						totalInput += value
 						if err != nil {
 							return err
 						}
@@ -152,12 +175,15 @@ func sync(tx *sql.Tx) error{
 						 }else {
 							 spend[address] = value
 						 }
+						from += address + ","
 					}
 					vout :=  vm["vout"].([]interface{})
 					receive := make(map[string]float64)
+					totalOutput := 0.0
 					for _ , vv := range vout{
 						vvm := vv.(map[string]interface{})
 						value, err:= strconv.ParseFloat( vvm["value"].(string),64)
+						totalOutput += value
 						if err != nil {
 							return err
 						}
@@ -168,9 +194,11 @@ func sync(tx *sql.Tx) error{
 						}else {
 							receive[address] = value
 						}
+						to += address +","
 					}
-
+					fee := math.Round((totalInput - totalOutput)*ELA)/ELA
 					for k , r := range receive {
+						_type = INCOME
 						s , ok := spend[k]
 						var value float64
 						if ok {
@@ -178,13 +206,13 @@ func sync(tx *sql.Tx) error{
 								value = math.Round((s - r)*ELA)
 								_type = SPEND
 							}else {
-								value = r - s
+								value = math.Round((r - s)*ELA)
 							}
 							delete(spend,k)
 						}else {
-							value = r
+							value = math.Round(r*ELA)
 						}
-						_ , err := stmt.Exec(k,txid,_type,strconv.FormatFloat(value/ELA,'f',8,64),strconv.FormatFloat(time,'f',0,64),curr)
+						_ , err := stmt.Exec(k,txid,_type,strconv.FormatFloat(value/ELA,'f',8,64),strconv.FormatFloat(time,'f',0,64),curr,fee,from,to)
 						if err != nil {
 							return err
 						}
@@ -192,7 +220,7 @@ func sync(tx *sql.Tx) error{
 
 					for k , r := range spend {
 						_type = SPEND
-						_ , err := stmt.Exec(k,txid,_type,strconv.FormatFloat(r,'f',8,64),strconv.FormatFloat(time,'f',0,64),curr)
+						_ , err := stmt.Exec(k,txid,_type,strconv.FormatFloat(r,'f',8,64),strconv.FormatFloat(time,'f',0,64),curr,fee,from,to)
 						if err != nil {
 							return err
 						}
@@ -217,8 +245,32 @@ func init(){
 func history(w http.ResponseWriter, r *http.Request){
 	params := mux.Vars(r)
 	address := params["addr"]
-	s , err := db.Prepare("select txid,type,value,createTime,height from block_transaction_history where address = ?")
-
+	pageNum := r.FormValue("pageNum")
+	var sql string
+	if pageNum != "" {
+		pageSize := r.FormValue("pageSize")
+		var size int64
+		if pageSize != "" {
+			var err error
+			size , err = strconv.ParseInt(pageSize ,10,64)
+			if err != nil {
+				w.Write([]byte(`{"result":"`+err.Error()+`",status:400}`))
+				return
+			}
+		}else{
+			size = 10
+		}
+		num , err := strconv.ParseInt(pageNum ,10,64)
+		if err != nil {
+			w.Write([]byte(`{"result":"`+err.Error()+`",status:400}`))
+			return
+		}
+		from := num * (size-1)
+		sql = "select txid,type,value,createTime,height,inputs,outputs,fee from block_transaction_history where address = ? limit " + strconv.FormatInt(from,10) + "," + strconv.FormatInt(size,10)
+	}else{
+		sql = "select txid,type,value,createTime,height,inputs,outputs,fee from block_transaction_history where address = ?"
+	}
+	s , err := db.Prepare(sql)
 	if err != nil{
 		w.Write([]byte(`{"result":"`+ERROR_REQUEST + err.Error()+`",status:500}`))
 		return
@@ -229,16 +281,36 @@ func history(w http.ResponseWriter, r *http.Request){
 		return
 	}
 	bhs := make([]Block_transaction_history,0)
+	totalNum := 0
 	for rst.Next() {
 		history :=Block_transaction_history{}
-		err := rst.Scan(&history.Txid,&history.Type,&history.Value,&history.CreateTime,&history.Height)
+		var inputs , outputs string
+		err := rst.Scan(&history.Txid,&history.Type,&history.Value,&history.CreateTime,&history.Height,&inputs,&outputs,&history.Fee)
+		inputsArr := strings.Split(inputs,",")
+		history.Inputs = inputsArr[:len(inputsArr)-1]
+		outputsArr := strings.Split(outputs,",")
+		history.Outputs = outputsArr[:len(outputsArr)-1]
 		if err != nil {
 			w.Write([]byte(`{"result":"`+ERROR_REQUEST + err.Error()+`",status:500}`))
 			return
 		}
 		bhs = append(bhs,history)
 	}
-	addrHis := Address_history{bhs}
+	defer func() {s.Close() ; rst.Close()}()
+	ss , err := db.Prepare("select count(*) as count from block_transaction_history where address = ?")
+	if err != nil {
+		w.Write([]byte(`{"result":"`+ERROR_REQUEST + err.Error()+`",status:500}`))
+		return
+	}
+	rsts , err := ss.Query(address)
+	if err != nil {
+		w.Write([]byte(`{"result":"`+ERROR_REQUEST + err.Error()+`",status:500}`))
+		return
+	}
+	rsts.Next()
+	rsts.Scan(&totalNum)
+	defer func() {ss.Close() ; rsts.Close()}()
+	addrHis := Address_history{bhs,totalNum}
 	buf , err := json.Marshal(&addrHis)
 	if err != nil {
 		w.Write([]byte(`{"result":"`+ERROR_REQUEST + err.Error()+`",status:500}`))
@@ -285,7 +357,8 @@ func initializeTable(){
 	createTableSqlStmtArr := []string{
 		`create table IF not exists block_currHeight (id integer not null primary key , height integer not null);`,
 		`create table IF not exists block_transaction_history (id integer not null primary key , address varchar(34) not null ,
-		txid varchar(64) not null ,type blob not null, value DECIMAL(18,8) not null, createTime blob not null , height integer not null);`,
+		txid varchar(64) not null ,type blob not null, value DECIMAL(18,8) not null, createTime blob not null , height integer not null,fee blob not null,
+		inputs blob  not null ,outputs blob not null);`,
 	}
 
 	for _ , v := range createTableSqlStmtArr {
