@@ -1,3 +1,4 @@
 {
-  "Node":"http://localhost:21334"
+  "Node":"http://localhost:21334",
+  "ServerPort":"8080"
 }

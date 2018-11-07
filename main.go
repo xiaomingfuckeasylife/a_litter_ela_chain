@@ -22,7 +22,7 @@ var (
 )
 
 type Config struct {
-	Node string `json:Node`
+	Node , ServerPort string
 }
 
 type Address_history struct{
@@ -56,7 +56,7 @@ const (
 func main(){
 	go SyncChain()
 	defer db.Close()
-	http.ListenAndServe(":8080",router)
+	http.ListenAndServe(":"+Conf.ServerPort,router)
 }
 
 
